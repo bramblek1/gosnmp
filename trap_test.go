@@ -26,6 +26,9 @@ const (
 	trapTestPort       = 9162
 	trapTestPortString = "9162"
 
+	trapTestSecondPort       = 9163
+	trapTestSecondPortString = "9163"
+
 	trapTestOid     = ".1.2.1234.4.5"
 	trapTestPayload = "TRAPTEST1234"
 
@@ -710,6 +713,165 @@ func TestSendV3TrapSHAAuthNoPriv(t *testing.T) {
 	}
 
 }
+
+func TestSendManyV3TrapMD5AuthNoPriv(t *testing.T) {
+	done := make(chan int)
+	done2 := make(chan int)
+
+	tl := NewTrapListener()
+	tl2 := NewTrapListener()
+	defer tl.Close()
+	defer tl2.Close()
+
+	sp := &UsmSecurityParameters{
+		UserName:                 "test",
+		AuthenticationProtocol:   MD5,
+		AuthenticationPassphrase: "password",
+		AuthoritativeEngineBoots: 1,
+		AuthoritativeEngineTime:  1,
+		AuthoritativeEngineID:    string([]byte{0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04}),
+	}
+
+	sp2 := &UsmSecurityParameters{
+		UserName:                 "multi",
+		AuthenticationProtocol:   MD5,
+		AuthenticationPassphrase: "multi-auth-param",
+		AuthoritativeEngineBoots: 1,
+		AuthoritativeEngineTime:  1,
+		AuthoritativeEngineID:    string([]byte{0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04}),
+	}
+
+	tl.OnNewTrap = makeTestTrapHandler(t, done, Version3)
+	tl.Params = Default
+	tl.Params.Version = Version3
+	tl.Params.SecurityParameters = sp
+	tl.Params.SecurityModel = UserSecurityModel
+	tl.Params.MsgFlags = AuthNoPriv
+
+	tl2.OnNewTrap = makeTestTrapHandler(t, done2, Version3)
+	tl2.Params = &GoSNMP{
+		Port:               162,
+		Transport:          udp,
+		Community:          "public",
+		Timeout:            time.Duration(2) * time.Second,
+		Retries:            3,
+		ExponentialTimeout: true,
+		Version:            Version3,
+		SecurityParameters: sp2,
+		SecurityModel:      UserSecurityModel,
+		MsgFlags:           AuthNoPriv,
+	}
+
+	// listener goroutine
+	errch := make(chan error)
+	errch2 := make(chan error)
+
+	// First listener
+	go func() {
+		err := tl.Listen(net.JoinHostPort(trapTestAddress, trapTestPortString))
+		if err != nil {
+			errch <- err
+		}
+	}()
+
+	// Wait until the listener is ready.
+	select {
+	case <-tl.Listening():
+	case err := <-errch:
+		t.Fatalf("error in listen: %v", err)
+	}
+
+	//Second listener
+	go func() {
+		err := tl2.Listen(net.JoinHostPort(trapTestAddress, trapTestSecondPortString))
+		if err != nil {
+			errch2 <- err
+		}
+	}()
+
+	select {
+	case <-tl2.Listening():
+	case err := <-errch2:
+		t.Fatalf("error in second listener: %v", err)
+	}
+
+	ts := &GoSNMP{
+		Target: trapTestAddress,
+		Port:   trapTestPort,
+		//Community: "public",
+		Version:            Version3,
+		Timeout:            time.Duration(2) * time.Second,
+		Retries:            3,
+		MaxOids:            MaxOids,
+		SecurityModel:      UserSecurityModel,
+		SecurityParameters: sp,
+		MsgFlags:           AuthNoPriv,
+	}
+
+	ts2 := &GoSNMP{
+		Target:             trapTestAddress,
+		Port:               trapTestSecondPort,
+		Version:            Version3,
+		Timeout:            time.Duration(2) * time.Second,
+		Retries:            3,
+		MaxOids:            MaxOids,
+		SecurityModel:      UserSecurityModel,
+		SecurityParameters: sp2,
+		MsgFlags:           AuthNoPriv,
+	}
+
+	err := ts.Connect()
+	if err != nil {
+		t.Fatalf("Connect() err: %v", err)
+	}
+	defer ts.Conn.Close()
+
+	err = ts2.Connect()
+	if err != nil {
+		t.Fatalf("Connect() second sender err: %v", err)
+	}
+	defer ts2.Conn.Close()
+
+	pdu := SnmpPDU{
+		Name:  trapTestOid,
+		Type:  OctetString,
+		Value: trapTestPayload,
+	}
+
+	trap := SnmpTrap{
+		Variables:    []SnmpPDU{pdu},
+		Enterprise:   trapTestEnterpriseOid,
+		AgentAddress: trapTestAgentAddress,
+		GenericTrap:  trapTestGenericTrap,
+		SpecificTrap: trapTestSpecificTrap,
+		Timestamp:    trapTestTimestamp,
+	}
+
+	_, err = ts.SendTrap(trap)
+	if err != nil {
+		t.Fatalf("SendTrap() err: %v", err)
+	}
+
+	// wait for response from handler
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for trap to be received")
+	}
+
+	_, err = ts2.SendTrap(trap)
+	if err != nil {
+		t.Fatalf("SendTrap() second listener err: %v", err)
+	}
+
+	select {
+	case <-done2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for second listener trap to be received")
+	}
+
+}
+
 func TestSendV3TrapSHAAuthDESPriv(t *testing.T) {
 	done := make(chan int)
 
